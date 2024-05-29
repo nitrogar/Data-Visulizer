@@ -1,0 +1,6 @@
+
+#include <boost/compute.hpp>
+
+void gpu_correlation(std::vector<std::vector<float>> &y,
+                     std::vector<std::vector<float>> &x,
+                     std::vector<float> &o);

@@ -1,0 +1,249 @@
+#include "ComputeUnit.hpp"
+#include <boost/compute/algorithm/transform.hpp>
+#include <boost/compute/command_queue.hpp>
+#include <boost/compute/container/vector.hpp>
+#include <boost/compute/functional/math.hpp>
+#include <cstddef>
+#include <exception>
+#include <vector>
+#ifndef BOOST_COMPUTE_DEBUG_KERNEL_COMPILATION
+#define BOOST_COMPUTE_DEBUG_KERNEL_COMPILATION
+#endif
+
+namespace compute = boost::compute;
+const char correlation_kernel[] = BOOST_COMPUTE_STRINGIZE_SOURCE(
+    __kernel void pearson_corrleation(__global const float *y,
+                                      __global const float *x, const int y_span,
+                                      const int y_count, const int x_span,
+                                      const int x_count, __global float *o) {
+      const uint i = get_global_id(0);
+
+      printf("global id %d\n", i);
+    }
+
+    __kernel void substract_means(__global float *o, __global float *means,
+                                  const int o_span) {
+      const uint i = get_global_id(0);
+      uint m_i = i % o_span;
+      o[i] = o[i] - means[m_i];
+    }
+
+    __kernel void multiply_terms(__global float *y, __global float *x,
+                                 const int y_span, const int x_span,
+                                 __global float *o) {
+      const uint y_i = get_global_id(0);
+      const uint x_i = get_global_id(1);
+
+      uint yi = y_i % y_span;
+      uint yj = y_i / y_span;
+      uint xi = x_i;
+      uint xj = yj;
+      uint o_span = y_span * x_span;
+      uint oi = xi * y_span + yi; // 1
+      uint oj = yj; // 3
+      uint y_index = yi + yj * y_span;
+      uint x_index = xi + xj * x_span;
+      uint o_index = oi + oj * o_span; // 1 + 4*3 
+      o[o_index] = x[x_index] * y[y_index];
+    }
+
+    __kernel void square_terms(__global float *o) {
+      const uint o_i = get_global_id(0);
+      uint o_index = o_i;
+      o[o_i] = o[o_i] * o[o_i];
+    }
+
+    __kernel void sum_col(__global float *x, __global float *o, const int x_span,
+                          const int x_count) {
+      const uint i = get_global_id(0);
+      uint o_i = i % x_span;
+      float sum = 0;
+      for (uint k = 0; k < x_count; k++)
+        sum += x[i + k * x_span];
+
+      o[o_i] = sum;
+    }
+
+    __kernel void div_col(__global float *o, float divider) {
+      const uint i = get_global_id(0);
+      uint o_i = i;
+      o[o_i] = o[o_i] / divider;
+    }
+
+);
+
+void gpu_correlation(std::vector<std::vector<float>> &y,
+                     std::vector<std::vector<float>> &x,
+                     std::vector<float> &o) {
+  compute::device device = compute::system::default_device();
+  compute::context context(device);
+  compute::command_queue queue(context, device);
+  std::cout << "Found Device :" << device.name()
+            << "platform :" << device.platform().name() << std::endl;
+
+  int y_element_size = y.at(0).size();
+  int y_n = y.size();
+  int y_size = y_n * y_element_size;
+  int y_trans = 0;
+
+  int x_element_size = x.at(0).size();
+  int x_n = x.size();
+  int x_size = x_n * x_element_size;
+  int x_trans = 0;
+
+  int o_size = y_size;
+
+  compute::vector<compute::float_> g_y(y_size, context);
+  compute::vector<compute::float_> g_x(x_size, context);
+
+  compute::vector<compute::float_> y_means(y_element_size, context);
+  compute::vector<compute::float_> x_means(y_element_size, context);
+  compute::vector<compute::float_> xi_yi(y_size * x_element_size, context);
+
+  compute::vector<compute::float_> sum_xi_yi(y_element_size * x_element_size, context);
+
+  std::cout << "copying y" << std::endl;
+  for (int i = 0; i < y.size(); i++)
+    compute::copy(y[i].begin(), y[i].end(), g_y.begin() + i * y_element_size,
+                  queue);
+
+  std::cout << "copying x" << std::endl;
+  for (int i = 0; i < x.size(); i++)
+    compute::copy(x[i].begin(), x[i].end(), g_x.begin() + i * x_element_size,
+                  queue);
+
+  std::cout << "calling kernel" << std::endl;
+  compute::program correlation_program =
+      compute::program::create_with_source(correlation_kernel, context);
+  try {
+    correlation_program.build();
+    compute::kernel sum(correlation_program, "sum_col");
+    sum.set_arg(0, g_y);
+    sum.set_arg(1, y_means);
+    sum.set_arg(2, y_element_size);
+    sum.set_arg(3, y_n);
+    queue.enqueue_1d_range_kernel(sum, 0, y_element_size, 0);
+
+    sum.set_arg(0, g_x);
+    sum.set_arg(1, x_means);
+    sum.set_arg(2, x_element_size);
+    sum.set_arg(3, x_n);
+    queue.enqueue_1d_range_kernel(sum, 0, x_element_size, 0);
+
+    queue.finish();
+    compute::kernel div(correlation_program, "div_col");
+    div.set_arg(0, y_means);
+    div.set_arg(1, (float)y_n);
+    queue.enqueue_1d_range_kernel(div, 0, y_element_size, 0);
+
+    div.set_arg(0, x_means);
+    div.set_arg(1, (float)x_n);
+    queue.enqueue_1d_range_kernel(div, 0, x_element_size, 0);
+
+    queue.finish();
+    std::cout << "y means: ";
+    for (auto f : y_means)
+      std::cout << f << "   ";
+    std::cout << std::endl;
+
+    std::cout << "x means: ";
+    for (auto f : x_means)
+      std::cout << f << "   ";
+    std::cout << std::endl;
+
+    compute::kernel sub(correlation_program, "substract_means");
+    sub.set_arg(0, g_y);
+    sub.set_arg(1, y_means);
+    sub.set_arg(2, y_element_size);
+    queue.enqueue_1d_range_kernel(sub, 0, y_size, 0);
+
+    sub.set_arg(0, g_x);
+    sub.set_arg(1, x_means);
+    sub.set_arg(2, x_element_size);
+    queue.enqueue_1d_range_kernel(sub, 0, x_size, 0);
+
+  queue.finish();
+    std::cout << "y - means: ";
+    for (auto f : g_y)
+      std::cout << f << "   ";
+    std::cout << std::endl;
+
+    std::cout << "x - means: ";
+    for (auto f : g_x)
+      std::cout << f << "   ";
+    std::cout << std::endl;
+
+    compute::kernel mult(correlation_program, "multiply_terms");
+    mult.set_arg(0, g_y);
+    mult.set_arg(1, g_x);
+    mult.set_arg(2, y_element_size);
+    mult.set_arg(3, x_element_size);
+    mult.set_arg(4, xi_yi);
+    queue.enqueue_nd_range_kernel(mult, compute::dim(0,0), compute::dim(y_size,x_element_size), compute::dim(1,1));
+
+  queue.finish();
+    std::cout << "x - y: ";
+    for (auto f : xi_yi)
+      std::cout << f << "   ";
+    std::cout << std::endl;
+
+    compute::kernel square(correlation_program, "square_terms");
+    square.set_arg(0, g_y);
+    queue.enqueue_1d_range_kernel(square, 0, y_size, 0);
+
+    square.set_arg(0, g_x);
+    queue.enqueue_1d_range_kernel(square, 0, x_size, 0);
+
+  queue.finish();
+    std::cout << "x2: ";
+    for (auto f : g_x)
+      std::cout << f << "   ";
+    std::cout << std::endl;
+
+    std::cout << "y2: ";
+    for (auto f : g_y)
+      std::cout << f << "   ";
+    std::cout << std::endl;
+
+
+
+    sum.set_arg(0, g_y);
+    sum.set_arg(1, y_means);
+    sum.set_arg(2, y_element_size);
+    sum.set_arg(3, y_n);
+    queue.enqueue_1d_range_kernel(sum, 0, y_element_size, 0);
+
+
+    sum.set_arg(0, g_x);
+    sum.set_arg(1, x_means);
+    sum.set_arg(2, x_element_size);
+    sum.set_arg(3, x_n);
+    queue.enqueue_1d_range_kernel(sum, 0, x_element_size, 0);
+
+    std::cout << "y sum: ";
+    for (auto f : y_means)
+      std::cout << f << "   ";
+    std::cout << std::endl;
+
+    std::cout << "x sum: ";
+    for (auto f : x_means)
+      std::cout << f << "   ";
+    std::cout << std::endl;
+
+    sum.set_arg(0, xi_yi);
+    sum.set_arg(1, sum_xi_yi);
+    sum.set_arg(2, y_element_size+x_element_size);
+    sum.set_arg(3, y_n);
+    queue.enqueue_1d_range_kernel(sum, 0, y_element_size + x_element_size, 0);
+
+    std::cout << "sum x - y: ";
+    for (auto f : sum_xi_yi)
+      std::cout << f << "   ";
+    std::cout << std::endl;
+
+  } catch (std::exception &e) {
+    std::cout << "exception" << std::endl;
+    std::cout << e.what() << std::endl;
+    std::cout << correlation_program.build_log() << std::endl;
+  }
+ }
